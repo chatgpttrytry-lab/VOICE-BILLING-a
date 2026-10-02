@@ -5779,15 +5779,22 @@ function billingVoiceCreateRecognition(SR,lang){
   r.lang=lang;
   r.onstart=()=>{billingVoiceRetry=0;billingVoiceButtonState(true);};
   r.onresult=(e)=>{
-    const text=String(e?.results?.[0]?.[0]?.transcript||'').trim();
-    if(!text){billingVoiceSetStatus('No voice text detected. Tap 🎤 and try again.');return;}
+    const result=e?.results?.[0];
+    const candidates=[];
+    if(result){for(let i=0;i<Math.min(5,result.length);i++){const t=String(result[i]?.transcript||'').trim();if(t&&!candidates.includes(t))candidates.push(t);}}
+    if(!candidates.length){billingVoiceSetStatus('No voice text detected. Tap 🎤 and try again.');return;}
     const input=document.getElementById('billing-search');
     if(!input)return;
-    input.value=text;
     billingBarcodePendingNotFound='';
+    const picked=billingVoicePickBestCommand(candidates);
+    if(picked?.item){
+      billingVoiceAddBillingQuantity(picked.item.id,picked.qty);
+      billingVoiceSetStatus('✓ Added: '+String(picked.item.name||'')+' × '+picked.qty+'  • Heard: '+picked.transcript);
+      return;
+    }
+    input.value=candidates[0];
     try{renderBillingSearch();}catch(err){console.error('Billing voice search render',err);}
-    try{input.focus({preventScroll:true});}catch(err){try{input.focus();}catch(_) {}}
-    billingVoiceSetStatus('✓ Voice: '+text);
+    billingVoiceSetStatus('✓ Voice: '+candidates[0]+' • Select the matching item');
   };
   r.onerror=(e)=>{
     billingVoiceButtonState(false);
@@ -5844,11 +5851,142 @@ function toggleBillingVoiceSearch(){
   billingVoiceStartRecognition(SR,preferred);
 }
 
+function billingVoiceNumberWordsToDigits(value){
+  const ones={zero:'0',oh:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9'};
+  const tens={ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,seventeen:17,eighteen:18,nineteen:19,twenty:20,thirty:30,forty:40,fifty:50,sixty:60,seventy:70,eighty:80,ninety:90};
+  const words=String(value||'').toLowerCase().replace(/[-]+/g,' ').split(/\s+/).filter(Boolean);
+  if(!words.length)return String(value||'');
+  let out=[],i=0;
+  while(i<words.length){
+    const w=words[i];
+    if(tens[w]!==undefined){let n=tens[w];if(i+1<words.length&&ones[words[i+1]]!==undefined){n+=Number(ones[words[i+1]]);i++;}out.push(String(n));}
+    else if(ones[w]!==undefined){let digits=ones[w];while(i+1<words.length&&ones[words[i+1]]!==undefined){digits+=ones[words[++i]];}out.push(digits);}
+    else out.push(w);
+    i++;
+  }
+  return out.join(' ');
+}
+function billingVoiceNormalizeSearch(value){
+  const spoken=billingVoiceNumberWordsToDigits(value);
+  return String(spoken||'').toLowerCase().normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/[^a-z0-9\u00c0-\uFFFF]+/gi,'');
+}
+function billingVoiceFuzzyMatch(text,query){
+  const t=billingVoiceNormalizeSearch(text), q=billingVoiceNormalizeSearch(query);
+  if(!q)return 0;if(t===q)return 3;if(t.startsWith(q))return 2;if(t.includes(q))return 1;
+  let qi=0;for(let i=0;i<t.length&&qi<q.length;i++)if(t[i]===q[qi])qi++;return qi===q.length?0.5:0;
+}
+/* Voice Billing matcher: handles common Indian-English ASR substitutions such as
+   Glow -> Blue, Lux -> Locks, Mamy -> Mummy, while preferring the real product
+   names already present in the local Item DB. */
+function billingVoiceEditDistance(a,b){
+  a=String(a||''); b=String(b||'');
+  if(a===b)return 0;if(!a)return b.length;if(!b)return a.length;
+  let prev=Array.from({length:b.length+1},(_,i)=>i);
+  for(let i=1;i<=a.length;i++){
+    const cur=[i];
+    for(let j=1;j<=b.length;j++){
+      cur[j]=Math.min(cur[j-1]+1,prev[j]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));
+    }
+    prev=cur;
+  }
+  return prev[b.length];
+}
+function billingVoiceTokenSimilarity(a,b){
+  a=billingVoiceNormalizeSearch(a); b=billingVoiceNormalizeSearch(b);
+  if(!a||!b)return 0;if(a===b)return 1;
+  const d=billingVoiceEditDistance(a,b),m=Math.max(a.length,b.length);
+  let score=1-d/m;
+  if(a.startsWith(b)||b.startsWith(a))score=Math.max(score,0.72);
+  return Math.max(0,score);
+}
+function billingVoiceStripCommandWords(value){
+  return String(value||'').toLowerCase()
+    .replace(/\\b(add|give|put|take|send|billing|bill|item|product|please|please add|want|need)\\b/g,' ')
+    .replace(/\\s+/g,' ').trim();
+}
+function billingVoiceParseCommand(value){
+  const raw=String(value||'').trim();
+  const normalized=billingVoiceStripCommandWords(raw).replace(/[-]+/g,' ');
+  if(!normalized)return {name:'',qty:1};
+  const words=normalized.split(/\\s+/).filter(Boolean);
+  let qty=1, end=words.length;
+  const last=words[end-1]||'';
+  let m=last.match(/^(\\d+(?:\\.\\d+)?)\\s*(?:pc|pcs|piece|pieces)$/i);
+  if(m){qty=Math.max(1,Number(m[1])||1);end--;}
+  else if(end>=2 && /^(?:pc|pcs|piece|pieces)$/i.test(words[end-1]) && /^\\d+(?:\\.\\d+)?$/.test(words[end-2])){
+    qty=Math.max(1,Number(words[end-2])||1);end-=2;
+  }else if(/^\\d+(?:\\.\\d+)?$/.test(last) && end>1){
+    qty=Math.max(1,Number(last)||1);end--;
+  }else if(/^(one|two|three|four|five|six|seven|eight|nine)$/.test(last) && end>1){
+    qty={one:1,two:2,three:3,four:4,five:5,six:6,seven:7,eight:8,nine:9}[last];end--;
+  }
+  const nameWords=words.slice(0,end);
+  return {name:nameWords.join(' '),qty:Math.min(999,Math.max(1,Math.round(qty)||1))};
+}
+function billingVoiceCandidateScore(productName,spokenName){
+  const p=billingVoiceNumberWordsToDigits(productName).toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  const q=billingVoiceNumberWordsToDigits(spokenName).toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+  if(!p||!q)return 0;
+  if(p===q)return 1;
+  const pt=p.split(/\\s+/),qt=q.split(/\\s+/);
+  let total=0,matched=0;
+  for(const qtok of qt){
+    let best=0;
+    for(const ptok of pt)best=Math.max(best,billingVoiceTokenSimilarity(ptok,qtok));
+    total+=best;if(best>=0.58)matched++;
+  }
+  const avg=total/qt.length;
+  const coverage=matched/qt.length;
+  const lengthPenalty=Math.abs(pt.length-qt.length)*0.035;
+  let score=avg*0.72+coverage*0.28-lengthPenalty;
+  if(p.includes(q)||q.includes(p))score=Math.max(score,0.82);
+  return Math.max(0,Math.min(1,score));
+}
+function billingVoicePickBestCommand(transcripts){
+  const db=getItemDB(); if(!Array.isArray(db)||!db.length)return null;
+  let best=null;
+  for(const transcript of transcripts){
+    const parsed=billingVoiceParseCommand(transcript);
+    if(!parsed.name)continue;
+    const ranked=db.map((item,index)=>({item,index,score:billingVoiceCandidateScore(item.name,parsed.name)}))
+      .sort((a,b)=>(b.score-a.score)||(a.index-b.index));
+    const top=ranked[0], second=ranked[1];
+    if(!top)continue;
+    const margin=top.score-(second?.score||0);
+    /* Strong exact/near-exact matches auto-add. Fuzzy matches require both a
+       reasonable score and a margin, preventing an unrelated product from
+       being added merely because ASR produced a short word. */
+    const threshold=parsed.name.replace(/[^a-z0-9]/gi,'').length<=3 ? 0.72 : 0.56;
+    const requiredMargin=top.score>=0.86 ? 0.025 : 0.075;
+    if(top.score>=threshold && margin>=requiredMargin){
+      if(!best || top.score>best.score)best={item:top.item,qty:parsed.qty,score:top.score,transcript,margin};
+    }
+  }
+  return best;
+}
+function billingVoiceAddBillingQuantity(id,qty){
+  const item=getItemDB().find(x=>Number(x.id)===Number(id));if(!item)return false;
+  const amount=Math.min(999,Math.max(1,Math.round(Number(qty)||1)));
+  const existing=billingCart.find(x=>Number(x.id)===Number(id));
+  if(existing){existing.qty=(Number(existing.qty)||0)+amount;}
+  else{
+    const newItem={id:item.id,code:item.code,name:invoiceStudioNormalizeItemName(item.name,item),mrp:Number(item.mrp)||0,rate:Number(item.rate)||0,purchase:Number(item.purchase)||0,qty:amount,tax:Number(item.tax)||0,discountSelected:false,discountPercent:billingDiscountPercent};
+    if(getBillingAddPosition()==='top')billingCart.unshift(newItem);else billingCart.push(newItem);
+  }
+  saveBillingCart();renderBillingCart();
+  if(document.getElementById('billing-camera-overlay')?.classList.contains('open'))billingCameraUpdateCartSummary();
+  const search=document.getElementById('billing-search');
+  if(search){search.value='';renderBillingSearch();requestAnimationFrame(()=>{try{search.focus({preventScroll:true});}catch(e){try{search.focus()}catch(_){}}});}
+  const b=document.getElementById('billing-overlay');if(b&&!b.classList.contains('open'))openBilling();
+  return true;
+}
+
 function renderBillingSearch(){
   const box=document.getElementById("billing-search-results"); if(!box)return;
   const input=document.getElementById("billing-search");
   const raw=(input?.value||"").trim();
   const q=raw.toLowerCase();
+  const normalizedQ=billingVoiceNormalizeSearch(raw);
   if(q!==billingKeyboardSearchQuery){billingKeyboardSearchQuery=q;billingKeyboardSelectedIndex=-1;}
   const db=getItemDB();
   const stats=getBillingSalesStats();
@@ -5862,9 +6000,17 @@ function renderBillingSearch(){
     return;
   }
 
-  let list=db.filter(x=>String(x.name).toLowerCase().includes(q)||String(x.code||"").toLowerCase().includes(q))
-    .map((x,i)=>({x,sold:getBillingItemSoldQty(x,stats),i,exact:String(x.name||"").toLowerCase()===q,prefix:String(x.name||"").toLowerCase().startsWith(q)}))
-    .sort((a,b)=>(b.exact-a.exact)||(b.prefix-a.prefix)||(b.sold-a.sold)||(a.i-b.i))
+  let list=db.map((x,i)=>{
+      const name=String(x.name||''), code=String(x.code||'');
+      const nl=name.toLowerCase(), cl=code.toLowerCase();
+      const exact=nl===q || cl===q;
+      const normalizedExact=billingVoiceNormalizeSearch(name)===normalizedQ || billingVoiceNormalizeSearch(code)===normalizedQ;
+      const prefix=billingVoiceFuzzyMatch(name,raw)>=2 || billingVoiceFuzzyMatch(code,raw)>=2;
+      const fuzzy=Math.max(billingVoiceFuzzyMatch(name,raw),billingVoiceFuzzyMatch(code,raw));
+      return {x,sold:getBillingItemSoldQty(x,stats),i,exact,normalizedExact,prefix,fuzzy};
+    })
+    .filter(o=>o.exact||o.normalizedExact||o.fuzzy>0)
+    .sort((a,b)=>(b.exact-a.exact)||(b.normalizedExact-a.normalizedExact)||(b.prefix-a.prefix)||(b.fuzzy-a.fuzzy)||(b.sold-a.sold)||(a.i-b.i))
     .slice(0,20);
 
   if(!list.length){
