@@ -5779,25 +5779,15 @@ function billingVoiceCreateRecognition(SR,lang){
   r.lang=lang;
   r.onstart=()=>{billingVoiceRetry=0;billingVoiceButtonState(true);};
   r.onresult=(e)=>{
-    const candidates=[...Array.from(e?.results||[])].flatMap(res=>Array.from(res||[]).slice(0,3).map(x=>String(x?.transcript||'').trim())).filter(Boolean);
-    let text=candidates[0]||'';
+    const text=String(e?.results?.[0]?.[0]?.transcript||'').trim();
     if(!text){billingVoiceSetStatus('No voice text detected. Tap 🎤 and try again.');return;}
     const input=document.getElementById('billing-search');
     if(!input)return;
-    billingBarcodePendingNotFound='';
-    let parsed=billingVoiceParseBillingCommand(text), match=parsed&&billingVoiceFindBillingItem(parsed.itemQuery);
-    if(!match){
-      for(const candidate of candidates.slice(1)){
-        const p=billingVoiceParseBillingCommand(candidate), m=p&&billingVoiceFindBillingItem(p.itemQuery);
-        if(m){text=candidate;parsed=p;match=m;break;}
-      }
-    }
-    if(match){
-      try{billingVoiceAddBillingQuantity(match.id,parsed.qty);input.value='';renderBillingSearch();billingVoiceSetStatus('✓ Added: '+match.name+' × '+parsed.qty);return;}catch(err){console.error('Voice Billing add',err);}
-    }
     input.value=text;
+    billingBarcodePendingNotFound='';
     try{renderBillingSearch();}catch(err){console.error('Billing voice search render',err);}
-    billingVoiceSetStatus(match?'✓ Voice: '+text:'⚠ Product not found: '+(parsed?.itemQuery||text));
+    try{input.focus({preventScroll:true});}catch(err){try{input.focus();}catch(_) {}}
+    billingVoiceSetStatus('✓ Voice: '+text);
   };
   r.onerror=(e)=>{
     billingVoiceButtonState(false);
@@ -5854,80 +5844,11 @@ function toggleBillingVoiceSearch(){
   billingVoiceStartRecognition(SR,preferred);
 }
 
-function billingVoiceIndianNormalizeText(value){
-  let s=String(value||'').toLowerCase().replace(/[\u2018\u2019]/g,"'").replace(/[^a-z0-9\s-]/g,' ').replace(/\s+/g,' ').trim();
-  [['six-one','sixty one'],['six one','sixty one'],['parachut','parachute'],['parachoot','parachute'],['parachutee','parachute'],['pcs','pc'],['pieces','pc'],['piece','pc']].forEach(([a,b])=>{s=s.split(a).join(b);});
-  return s;
-}
-function billingVoiceParseBillingCommand(value){
-  let raw=billingVoiceIndianNormalizeText(value);
-  raw=raw.replace(/^(?:add|give|put|billing|bill|item|product)\s+/i,'').trim();
-  if(!raw)return null;
-  const num='(?:\\d+|zero|oh|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)';
-  let qty=1,item=raw,m=raw.match(new RegExp('(?:^|\\s)('+num+')\\s*pc\\s*$','i'));
-  if(m){qty=Number(billingVoiceNumberWordsToDigits(m[1]));item=raw.slice(0,m.index).trim();}
-  else {
-    m=raw.match(new RegExp('(?:^|\\s)(\\d+)\\s*$'));
-    if(m){qty=Number(m[1]);item=raw.slice(0,m.index).trim();}
-    else {
-      const bare=raw.match(/(?:^|\\s)(one|two|three|four|five|six|seven|eight|nine)\\s*$/i);
-      if(bare){
-        const before=raw.slice(0,bare.index).trim();
-        const last=before.split(/\\s+/).pop()||'';
-        // Keep “sixty one” / “twenty one” as a product-number phrase.
-        if(!/^(?:ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)$/.test(last)){
-          qty=Number(billingVoiceNumberWordsToDigits(bare[1]));item=before;
-        }
-      }
-    }
-  }
-  qty=Math.max(1,Math.min(999,Math.round(qty||1)));
-  return item?{itemQuery:item,qty}:null;
-}
-function billingVoiceFindBillingItem(query){
-  const nq=billingVoiceNormalizeSearch(query); let best=null,score=-1;
-  getItemDB().forEach(x=>{const n=String(x.name||''),c=String(x.code||''),nn=billingVoiceNormalizeSearch(n),cc=billingVoiceNormalizeSearch(c);let z=0;if(nn===nq||cc===nq)z=100;else if(nn.startsWith(nq)||cc.startsWith(nq))z=80;else if(nn.includes(nq)||cc.includes(nq))z=60;else z=Math.max(billingVoiceFuzzyMatch(n,query),billingVoiceFuzzyMatch(c,query))*20;if(z>score){score=z;best=x;}});
-  return score>=60?best:null;
-}
-function billingVoiceAddBillingQuantity(id,qty){
-  addDBItemToBilling(Number(id));
-  const row=billingCart.find(x=>Number(x.id)===Number(id));
-  if(row)row.qty=Math.max(1,Math.min(999,Math.round(Number(qty)||1)));
-  try{saveBillingCart();}catch(e){}
-  try{renderBillingCart();}catch(e){}
-  return true;
-}
-
-function billingVoiceNumberWordsToDigits(value){
-  const ones={zero:'0',oh:'0',one:'1',two:'2',three:'3',four:'4',five:'5',six:'6',seven:'7',eight:'8',nine:'9'};
-  const tens={ten:10,eleven:11,twelve:12,thirteen:13,fourteen:14,fifteen:15,sixteen:16,seventeen:17,eighteen:18,nineteen:19,twenty:20,thirty:30,forty:40,fifty:50,sixty:60,seventy:70,eighty:80,ninety:90};
-  const words=String(value||'').toLowerCase().replace(/[-]+/g,' ').split(/\s+/).filter(Boolean);
-  if(!words.length)return String(value||'');
-  let out=[],i=0;
-  while(i<words.length){
-    const w=words[i];
-    if(tens[w]!==undefined){let n=tens[w];if(i+1<words.length&&ones[words[i+1]]!==undefined){n+=Number(ones[words[i+1]]);i++;}out.push(String(n));}
-    else if(ones[w]!==undefined){let digits=ones[w];while(i+1<words.length&&ones[words[i+1]]!==undefined){digits+=ones[words[++i]];}out.push(digits);}
-    else out.push(w);
-    i++;
-  }
-  return out.join(' ');
-}
-function billingVoiceNormalizeSearch(value){
-  const spoken=billingVoiceNumberWordsToDigits(value);
-  return String(spoken||'').toLowerCase().normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g,'').replace(/[^a-z0-9\u00c0-\uFFFF]+/gi,'');
-}
-function billingVoiceFuzzyMatch(text,query){
-  const t=billingVoiceNormalizeSearch(text), q=billingVoiceNormalizeSearch(query);
-  if(!q)return 0;if(t===q)return 3;if(t.startsWith(q))return 2;if(t.includes(q))return 1;
-  let qi=0;for(let i=0;i<t.length&&qi<q.length;i++)if(t[i]===q[qi])qi++;return qi===q.length?0.5:0;
-}
 function renderBillingSearch(){
   const box=document.getElementById("billing-search-results"); if(!box)return;
   const input=document.getElementById("billing-search");
   const raw=(input?.value||"").trim();
   const q=raw.toLowerCase();
-  const normalizedQ=billingVoiceNormalizeSearch(raw);
   if(q!==billingKeyboardSearchQuery){billingKeyboardSearchQuery=q;billingKeyboardSelectedIndex=-1;}
   const db=getItemDB();
   const stats=getBillingSalesStats();
@@ -5941,17 +5862,9 @@ function renderBillingSearch(){
     return;
   }
 
-  let list=db.map((x,i)=>{
-      const name=String(x.name||''), code=String(x.code||'');
-      const nl=name.toLowerCase(), cl=code.toLowerCase();
-      const exact=nl===q || cl===q;
-      const normalizedExact=billingVoiceNormalizeSearch(name)===normalizedQ || billingVoiceNormalizeSearch(code)===normalizedQ;
-      const prefix=billingVoiceFuzzyMatch(name,raw)>=2 || billingVoiceFuzzyMatch(code,raw)>=2;
-      const fuzzy=Math.max(billingVoiceFuzzyMatch(name,raw),billingVoiceFuzzyMatch(code,raw));
-      return {x,sold:getBillingItemSoldQty(x,stats),i,exact,normalizedExact,prefix,fuzzy};
-    })
-    .filter(o=>o.exact||o.normalizedExact||o.fuzzy>0)
-    .sort((a,b)=>(b.exact-a.exact)||(b.normalizedExact-a.normalizedExact)||(b.prefix-a.prefix)||(b.fuzzy-a.fuzzy)||(b.sold-a.sold)||(a.i-b.i))
+  let list=db.filter(x=>String(x.name).toLowerCase().includes(q)||String(x.code||"").toLowerCase().includes(q))
+    .map((x,i)=>({x,sold:getBillingItemSoldQty(x,stats),i,exact:String(x.name||"").toLowerCase()===q,prefix:String(x.name||"").toLowerCase().startsWith(q)}))
+    .sort((a,b)=>(b.exact-a.exact)||(b.prefix-a.prefix)||(b.sold-a.sold)||(a.i-b.i))
     .slice(0,20);
 
   if(!list.length){
